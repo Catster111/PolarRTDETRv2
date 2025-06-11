@@ -245,7 +245,7 @@ class TransformerDecoder(nn.Module):
             if self.training:
                 dec_out_logits.append(score_head[i](output))
                 dec_out_landmarks.append(landmark_head[i](output))
-                dec_out_polar.append(torch.cat([polar_head[i]["angle_cls"](output), polar_head[i]["angle_reg"](output), polar_head[i]["magnitude"](output)], dim=-1))
+                dec_out_polar.append(polar_head[i](output))
                 
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
@@ -255,7 +255,7 @@ class TransformerDecoder(nn.Module):
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
                 dec_out_landmarks.append(landmark_head[i](output))
-                dec_out_polar.append(torch.cat([polar_head[i]["angle_cls"](output), polar_head[i]["angle_reg"](output), polar_head[i]["magnitude"](output)], dim=-1))
+                dec_out_polar.append(polar_head[i](output))
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
@@ -384,8 +384,6 @@ class PolarFaceTransformer(nn.Module):
 
         # Landmark heatmap head
         self.landmark_heatmap_head = LandmarkHeatmapHead(hidden_dim, num_landmarks, heatmap_size)
-        # Channel projection for landmark heatmap head
-        self.landmark_proj = nn.Conv2d(336, hidden_dim, 1)  # Project to expected channels
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -564,7 +562,7 @@ class PolarFaceTransformer(nn.Module):
         memory, spatial_shapes = self._get_encoder_input(feats)
         
         # prepare denoising training
-        if self.training and self.num_denoising > 0 and targets is not None:
+        if self.training and self.num_denoising > 0:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
                 get_contrastive_denoising_training_group(targets, 
                     self.num_classes, 
@@ -593,9 +591,8 @@ class PolarFaceTransformer(nn.Module):
             attn_mask=attn_mask)
 
         # Generate landmark heatmaps from features
-                # Project memory channels and generate landmark heatmaps
-        memory_reshaped = memory.permute(0, 2, 1).reshape(memory.shape[0], -1, *spatial_shapes[0])
-        landmark_heatmaps = self.landmark_heatmap_head(self.landmark_proj(memory_reshaped))
+        landmark_heatmaps = self.landmark_heatmap_head(
+            memory.permute(0, 2, 1).reshape(memory.shape[0], -1, *spatial_shapes[0]))
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
@@ -654,7 +651,7 @@ class PolarFaceTransformer(nn.Module):
         aux_outputs = []
         for i, (a, b) in enumerate(zip(outputs_class, outputs_coord)):
             aux_out = {'pred_logits': a, 'pred_boxes': b}
-            if outputs_landmarks is not None and len(outputs_landmarks) > 0 and i < len(outputs_landmarks):
+            if outputs_landmarks and i < len(outputs_landmarks):
                 aux_out['pred_landmarks'] = outputs_landmarks[i]
             if outputs_polar and i < len(outputs_polar):
                 aux_out['pred_polar'] = outputs_polar[i]

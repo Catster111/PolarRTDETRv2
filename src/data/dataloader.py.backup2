@@ -166,10 +166,6 @@ class FaceLandmarkCollateFuncion(BaseCollateFunction):
         scale_x = self.heatmap_size / w
         scale_y = self.heatmap_size / h
         
-        # Ensure landmarks is flattened and accessible as scalars
-        if landmarks.dim() > 1:
-            landmarks = landmarks.flatten()
-        
         for i in range(num_landmarks):
             x = float(landmarks[i * 2]) * scale_x
             y = float(landmarks[i * 2 + 1]) * scale_y
@@ -197,9 +193,6 @@ class FaceLandmarkCollateFuncion(BaseCollateFunction):
         return heatmap
     
     def _generate_polar_features(self, landmarks):
-        # Ensure landmarks is flattened and accessible as scalars
-        if landmarks.dim() > 1:
-            landmarks = landmarks.flatten()
         """Generate polar domain features from landmarks"""
         if len(landmarks) < 10:  # Need at least 5 landmarks (10 coordinates)
             return {
@@ -209,7 +202,7 @@ class FaceLandmarkCollateFuncion(BaseCollateFunction):
             }
         
         # Get key landmarks (assuming 5-point landmarks: left_eye, right_eye, nose, left_mouth, right_mouth)
-        left_eye = torch.tensor([float(landmarks[0]), float(landmarks[1])])
+        left_eye = torch.tensor([landmarks[0], landmarks[1]])
         right_eye = torch.tensor([landmarks[2], landmarks[3]])
         nose = torch.tensor([landmarks[4], landmarks[5]])
         
@@ -237,7 +230,7 @@ class FaceLandmarkCollateFuncion(BaseCollateFunction):
         
         return {
             'polar_angle_bin': torch.tensor(angle_bin, dtype=torch.long),
-            'polar_angle_reg': angle_offset.clone().detach().to(torch.float32),
-            'polar_magnitude': magnitude.clone().detach().to(torch.float32),
+            'polar_angle_reg': torch.tensor(angle_offset, dtype=torch.float32),
+            'polar_magnitude': torch.tensor(magnitude, dtype=torch.float32),
             'face_center': face_center
         }
