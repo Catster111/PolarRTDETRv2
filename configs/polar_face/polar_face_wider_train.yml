@@ -173,7 +173,7 @@ train_dataloader:
     landmark_sigma: 2.0
 
   shuffle: True
-  total_batch_size: 16
+  total_batch_size: 8
   num_workers: 4
 
 val_dataloader:
@@ -200,7 +200,7 @@ val_dataloader:
     landmark_sigma: 2.0
     
   shuffle: False
-  total_batch_size: 16
+  total_batch_size: 8
   num_workers: 4
 
 # Evaluation
