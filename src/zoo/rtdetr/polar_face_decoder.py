@@ -1,0 +1,659 @@
+"""Copyright(c) 2023 lyuwenyu. All Rights Reserved.
+
+Polar Face Transformer Decoder for face detection and landmark localization
+"""
+
+import math
+import copy
+import functools
+from collections import OrderedDict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+from typing import List
+
+from .denoising import get_contrastive_denoising_training_group
+from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
+from .utils import bias_init_with_prob
+
+from ...core import register
+
+__all__ = ['PolarFaceTransformer']
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, act='relu'):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.act = get_activation(act)
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = self.act(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+
+class PolarEmbedding(nn.Module):
+    """Polar domain embedding for face rotation"""
+    
+    def __init__(self, hidden_dim=256, polar_bins=36):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.polar_bins = polar_bins
+        
+        # Polar angle embedding (classification)
+        self.polar_angle_embed = nn.Embedding(polar_bins, hidden_dim // 2)
+        
+        # Polar magnitude embedding (continuous)
+        self.polar_magnitude_embed = MLP(1, hidden_dim // 4, hidden_dim // 4, 2)
+        
+        # Polar regression embedding (continuous offset within bin)
+        self.polar_regression_embed = MLP(1, hidden_dim // 4, hidden_dim // 4, 2)
+        
+        # Fusion layer
+        self.fusion = nn.Linear(hidden_dim, hidden_dim)
+        
+    def forward(self, polar_features):
+        """
+        Args:
+            polar_features: Dict containing:
+                - polar_angle_bin: [B, N] angle bin indices
+                - polar_angle_reg: [B, N] regression offset within bin
+                - polar_magnitude: [B, N] magnitude values
+        """
+        batch_size, num_queries = polar_features['polar_angle_bin'].shape
+        
+        # Angle embedding
+        angle_embed = self.polar_angle_embed(polar_features['polar_angle_bin'])  # [B, N, D//2]
+        
+        # Magnitude embedding
+        magnitude_embed = self.polar_magnitude_embed(
+            polar_features['polar_magnitude'].unsqueeze(-1))  # [B, N, D//4]
+        
+        # Regression embedding
+        regression_embed = self.polar_regression_embed(
+            polar_features['polar_angle_reg'].unsqueeze(-1))  # [B, N, D//4]
+        
+        # Concatenate and fuse
+        polar_embed = torch.cat([angle_embed, magnitude_embed, regression_embed], dim=-1)
+        polar_embed = self.fusion(polar_embed)
+        
+        return polar_embed
+
+
+class LandmarkHeatmapHead(nn.Module):
+    """Head for landmark heatmap prediction"""
+    
+    def __init__(self, hidden_dim=256, num_landmarks=5, heatmap_size=64):
+        super().__init__()
+        self.num_landmarks = num_landmarks
+        self.heatmap_size = heatmap_size
+        
+        # Deconvolution layers for heatmap upsampling
+        self.deconv_layers = nn.ModuleList([
+            nn.ConvTranspose2d(hidden_dim, hidden_dim // 2, 4, 2, 1),
+            nn.ConvTranspose2d(hidden_dim // 2, hidden_dim // 4, 4, 2, 1),
+            nn.ConvTranspose2d(hidden_dim // 4, num_landmarks, 4, 2, 1)
+        ])
+        
+        self.norm_layers = nn.ModuleList([
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.BatchNorm2d(hidden_dim // 4),
+            nn.BatchNorm2d(num_landmarks)
+        ])
+        
+        # Final heatmap prediction
+        self.heatmap_conv = nn.Conv2d(num_landmarks, num_landmarks, 1)
+        
+    def forward(self, features):
+        """
+        Args:
+            features: [B, D, H, W] feature maps
+        Returns:
+            heatmaps: [B, num_landmarks, heatmap_size, heatmap_size]
+        """
+        x = features
+        
+        for deconv, norm in zip(self.deconv_layers, self.norm_layers):
+            x = F.relu(norm(deconv(x)))
+        
+        heatmaps = torch.sigmoid(self.heatmap_conv(x))
+        
+        # Resize to target heatmap size if needed
+        if x.shape[-1] != self.heatmap_size:
+            heatmaps = F.interpolate(heatmaps, size=self.heatmap_size, mode='bilinear', align_corners=False)
+        
+        return heatmaps
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self,
+                 d_model=256,
+                 n_head=8,
+                 dim_feedforward=1024,
+                 dropout=0.,
+                 activation='relu',
+                 n_levels=3,
+                 n_points=4,
+                 cross_attn_method='default'):
+        super(TransformerDecoderLayer, self).__init__()
+
+        # self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # cross attention (reuse from RTDETRv2)
+        from .rtdetrv2_decoder import MSDeformableAttention
+        self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points, method=cross_attn_method)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # ffn
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.activation = get_activation(activation)
+        self.dropout3 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(d_model)
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        init.xavier_uniform_(self.linear1.weight)
+        init.xavier_uniform_(self.linear2.weight)
+
+    def with_pos_embed(self, tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward_ffn(self, tgt):
+        return self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+
+    def forward(self,
+                target,
+                reference_points,
+                memory,
+                memory_spatial_shapes,
+                attn_mask=None,
+                memory_mask=None,
+                query_pos_embed=None):
+        # self attention
+        q = k = self.with_pos_embed(target, query_pos_embed)
+
+        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
+        target = target + self.dropout1(target2)
+        target = self.norm1(target)
+
+        # cross attention
+        target2 = self.cross_attn(
+            self.with_pos_embed(target, query_pos_embed), 
+            reference_points, 
+            memory, 
+            memory_spatial_shapes, 
+            memory_mask)
+        target = target + self.dropout2(target2)
+        target = self.norm2(target)
+
+        # ffn
+        target2 = self.forward_ffn(target)
+        target = target + self.dropout4(target2)
+        target = self.norm3(target)
+
+        return target
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+        super(TransformerDecoder, self).__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+
+    def forward(self,
+                target,
+                ref_points_unact,
+                memory,
+                memory_spatial_shapes,
+                bbox_head,
+                score_head,
+                landmark_head,
+                polar_head,
+                query_pos_head,
+                attn_mask=None,
+                memory_mask=None):
+        dec_out_bboxes = []
+        dec_out_logits = []
+        dec_out_landmarks = []
+        dec_out_polar = []
+        ref_points_detach = F.sigmoid(ref_points_unact)
+
+        output = target
+        for i, layer in enumerate(self.layers):
+            ref_points_input = ref_points_detach.unsqueeze(2)
+            query_pos_embed = query_pos_head(ref_points_detach)
+
+            output = layer(output, ref_points_input, memory, memory_spatial_shapes, 
+                         attn_mask, memory_mask, query_pos_embed)
+
+            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
+
+            if self.training:
+                dec_out_logits.append(score_head[i](output))
+                dec_out_landmarks.append(landmark_head[i](output))
+                dec_out_polar.append(polar_head[i](output))
+                
+                if i == 0:
+                    dec_out_bboxes.append(inter_ref_bbox)
+                else:
+                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
+
+            elif i == self.eval_idx:
+                dec_out_logits.append(score_head[i](output))
+                dec_out_landmarks.append(landmark_head[i](output))
+                dec_out_polar.append(polar_head[i](output))
+                dec_out_bboxes.append(inter_ref_bbox)
+                break
+
+            ref_points = inter_ref_bbox
+            ref_points_detach = inter_ref_bbox.detach()
+
+        return (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), 
+                torch.stack(dec_out_landmarks), torch.stack(dec_out_polar))
+
+
+@register()
+class PolarFaceTransformer(nn.Module):
+    __share__ = ['num_classes', 'eval_spatial_size']
+
+    def __init__(self,
+                 num_classes=1,  # Only face class
+                 hidden_dim=256,
+                 num_queries=300,
+                 feat_channels=[512, 1024, 2048],
+                 feat_strides=[8, 16, 32],
+                 num_levels=3,
+                 num_points=4,
+                 nhead=8,
+                 num_layers=6,
+                 dim_feedforward=1024,
+                 dropout=0.,
+                 activation="relu",
+                 num_denoising=100,
+                 label_noise_ratio=0.5,
+                 box_noise_scale=1.0,
+                 learn_query_content=False,
+                 eval_spatial_size=None,
+                 eval_idx=-1,
+                 eps=1e-2, 
+                 aux_loss=True, 
+                 cross_attn_method='default',
+                 query_select_method='default',
+                 num_landmarks=5,
+                 polar_bins=36,
+                 heatmap_size=64):
+        super().__init__()
+        assert len(feat_channels) <= num_levels
+        assert len(feat_strides) == len(feat_channels)
+        
+        for _ in range(num_levels - len(feat_strides)):
+            feat_strides.append(feat_strides[-1] * 2)
+
+        self.hidden_dim = hidden_dim
+        self.nhead = nhead
+        self.feat_strides = feat_strides
+        self.num_levels = num_levels
+        self.num_classes = num_classes
+        self.num_queries = num_queries
+        self.eps = eps
+        self.num_layers = num_layers
+        self.eval_spatial_size = eval_spatial_size
+        self.aux_loss = aux_loss
+        self.num_landmarks = num_landmarks
+        self.polar_bins = polar_bins
+        self.heatmap_size = heatmap_size
+
+        assert query_select_method in ('default', 'one2many', 'agnostic'), ''
+        assert cross_attn_method in ('default', 'discrete'), ''
+        self.cross_attn_method = cross_attn_method
+        self.query_select_method = query_select_method
+
+        # backbone feature projection
+        self._build_input_proj_layer(feat_channels)
+
+        # Transformer module
+        decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, 
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method)
+        self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx)
+
+        # denoising
+        self.num_denoising = num_denoising
+        self.label_noise_ratio = label_noise_ratio
+        self.box_noise_scale = box_noise_scale
+        if num_denoising > 0: 
+            self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
+            init.normal_(self.denoising_class_embed.weight[:-1])
+
+        # decoder embedding
+        self.learn_query_content = learn_query_content
+        if learn_query_content:
+            self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2)
+
+        # Polar embedding
+        self.polar_embedding = PolarEmbedding(hidden_dim, polar_bins)
+
+        # encoder output
+        self.enc_output = nn.Sequential(OrderedDict([
+            ('proj', nn.Linear(hidden_dim, hidden_dim)),
+            ('norm', nn.LayerNorm(hidden_dim,)),
+        ]))
+
+        if query_select_method == 'agnostic':
+            self.enc_score_head = nn.Linear(hidden_dim, 1)
+        else:
+            self.enc_score_head = nn.Linear(hidden_dim, num_classes)
+
+        self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3)
+
+        # decoder heads
+        self.dec_score_head = nn.ModuleList([
+            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
+        ])
+        self.dec_bbox_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
+        ])
+        
+        # Landmark heads (predict 2D coordinates)
+        self.dec_landmark_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, num_landmarks * 2, 3) for _ in range(num_layers)
+        ])
+        
+        # Polar heads (predict polar domain features)
+        self.dec_polar_head = nn.ModuleList([
+            nn.ModuleDict({
+                'angle_cls': nn.Linear(hidden_dim, polar_bins),  # Angle classification
+                'angle_reg': nn.Linear(hidden_dim, 1),           # Angle regression offset
+                'magnitude': nn.Linear(hidden_dim, 1)            # Magnitude prediction
+            }) for _ in range(num_layers)
+        ])
+
+        # Landmark heatmap head
+        self.landmark_heatmap_head = LandmarkHeatmapHead(hidden_dim, num_landmarks, heatmap_size)
+
+        # init encoder output anchors and valid_mask
+        if self.eval_spatial_size:
+            anchors, valid_mask = self._generate_anchors()
+            self.register_buffer('anchors', anchors)
+            self.register_buffer('valid_mask', valid_mask)
+
+        self._reset_parameters()
+        
+    def _reset_parameters(self):
+        bias = bias_init_with_prob(0.01)
+        init.constant_(self.enc_score_head.bias, bias)
+        init.constant_(self.enc_bbox_head.layers[-1].weight, 0)
+        init.constant_(self.enc_bbox_head.layers[-1].bias, 0)
+
+        for _cls, _reg, _lmk, _polar in zip(self.dec_score_head, self.dec_bbox_head, 
+                                          self.dec_landmark_head, self.dec_polar_head):
+            init.constant_(_cls.bias, bias)
+            init.constant_(_reg.layers[-1].weight, 0)
+            init.constant_(_reg.layers[-1].bias, 0)
+            init.constant_(_lmk.layers[-1].weight, 0)
+            init.constant_(_lmk.layers[-1].bias, 0)
+            
+            # Initialize polar heads
+            init.constant_(_polar['angle_cls'].bias, 0)
+            init.constant_(_polar['angle_reg'].bias, 0)
+            init.constant_(_polar['magnitude'].bias, 0)
+        
+        init.xavier_uniform_(self.enc_output[0].weight)
+        if self.learn_query_content:
+            init.xavier_uniform_(self.tgt_embed.weight)
+        init.xavier_uniform_(self.query_pos_head.layers[0].weight)
+        init.xavier_uniform_(self.query_pos_head.layers[1].weight)
+        for m in self.input_proj:
+            init.xavier_uniform_(m[0].weight)
+
+    def _build_input_proj_layer(self, feat_channels):
+        self.input_proj = nn.ModuleList()
+        for in_channels in feat_channels:
+            self.input_proj.append(
+                nn.Sequential(OrderedDict([
+                    ('conv', nn.Conv2d(in_channels, self.hidden_dim, 1, bias=False)), 
+                    ('norm', nn.BatchNorm2d(self.hidden_dim,))])
+                )
+            )
+
+        in_channels = feat_channels[-1]
+
+        for _ in range(self.num_levels - len(feat_channels)):
+            self.input_proj.append(
+                nn.Sequential(OrderedDict([
+                    ('conv', nn.Conv2d(in_channels, self.hidden_dim, 3, 2, padding=1, bias=False)),
+                    ('norm', nn.BatchNorm2d(self.hidden_dim))])
+                )
+            )
+            in_channels = self.hidden_dim
+
+    def _get_encoder_input(self, feats: List[torch.Tensor]):
+        # get projection features
+        proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        if self.num_levels > len(proj_feats):
+            len_srcs = len(proj_feats)
+            for i in range(len_srcs, self.num_levels):
+                if i == len_srcs:
+                    proj_feats.append(self.input_proj[i](feats[-1]))
+                else:
+                    proj_feats.append(self.input_proj[i](proj_feats[-1]))
+
+        # get encoder inputs
+        feat_flatten = []
+        spatial_shapes = []
+        for i, feat in enumerate(proj_feats):
+            _, _, h, w = feat.shape
+            # [b, c, h, w] -> [b, h*w, c]
+            feat_flatten.append(feat.flatten(2).permute(0, 2, 1))
+            # [num_levels, 2]
+            spatial_shapes.append([h, w])
+        # [b, l, c]
+        feat_flatten = torch.concat(feat_flatten, 1)
+        return feat_flatten, spatial_shapes
+
+    def _generate_anchors(self,
+                          spatial_shapes=None,
+                          grid_size=0.05,
+                          dtype=torch.float32,
+                          device='cpu'):
+        if spatial_shapes is None:
+            spatial_shapes = []
+            eval_h, eval_w = self.eval_spatial_size
+            for s in self.feat_strides:
+                spatial_shapes.append([int(eval_h / s), int(eval_w / s)])
+
+        anchors = []
+        for lvl, (h, w) in enumerate(spatial_shapes):
+            grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+            grid_xy = torch.stack([grid_x, grid_y], dim=-1)
+            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / torch.tensor([w, h], dtype=dtype)
+            wh = torch.ones_like(grid_xy) * grid_size * (2.0 ** lvl)
+            lvl_anchors = torch.concat([grid_xy, wh], dim=-1).reshape(-1, h * w, 4)
+            anchors.append(lvl_anchors)
+
+        anchors = torch.concat(anchors, dim=1).to(device)
+        valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True)
+        anchors = torch.log(anchors / (1 - anchors))
+        anchors = torch.where(valid_mask, anchors, torch.inf)
+
+        return anchors, valid_mask
+
+    def _get_decoder_input(self,
+                           memory: torch.Tensor,
+                           spatial_shapes,
+                           denoising_logits=None,
+                           denoising_bbox_unact=None):
+
+        # prepare input for decoder
+        if self.training or self.eval_spatial_size is None:
+            anchors, valid_mask = self._generate_anchors(spatial_shapes, device=memory.device)
+        else:
+            anchors = self.anchors
+            valid_mask = self.valid_mask
+
+        memory = valid_mask.to(memory.dtype) * memory  
+
+        output_memory = self.enc_output(memory)
+        enc_outputs_logits = self.enc_score_head(output_memory)
+        enc_outputs_coord_unact = self.enc_bbox_head(output_memory) + anchors
+
+        enc_topk_bboxes_list, enc_topk_logits_list = [], []
+        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact = \
+            self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, self.num_queries)
+            
+        if self.training:
+            enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
+            enc_topk_bboxes_list.append(enc_topk_bboxes)
+            enc_topk_logits_list.append(enc_topk_logits)
+
+        if self.learn_query_content:
+            content = self.tgt_embed.weight.unsqueeze(0).tile([memory.shape[0], 1, 1])
+        else:
+            content = enc_topk_memory.detach()
+            
+        enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
+        
+        if denoising_bbox_unact is not None:
+            enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
+            content = torch.concat([denoising_logits, content], dim=1)
+        
+        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
+
+    def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, topk: int):
+        if self.query_select_method == 'default':
+            _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1)
+
+        elif self.query_select_method == 'one2many':
+            _, topk_ind = torch.topk(outputs_logits.flatten(1), topk, dim=-1)
+            topk_ind = topk_ind // self.num_classes
+
+        elif self.query_select_method == 'agnostic':
+            _, topk_ind = torch.topk(outputs_logits.squeeze(-1), topk, dim=-1)
+        
+        topk_ind: torch.Tensor
+
+        topk_coords = outputs_coords_unact.gather(dim=1, 
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_coords_unact.shape[-1]))
+        
+        topk_logits = outputs_logits.gather(dim=1, 
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_logits.shape[-1]))
+        
+        topk_memory = memory.gather(dim=1, 
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
+
+        return topk_memory, topk_logits, topk_coords
+
+    def forward(self, feats, targets=None):
+        # input projection and embedding
+        memory, spatial_shapes = self._get_encoder_input(feats)
+        
+        # prepare denoising training
+        if self.training and self.num_denoising > 0:
+            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
+                get_contrastive_denoising_training_group(targets, 
+                    self.num_classes, 
+                    self.num_queries, 
+                    self.denoising_class_embed, 
+                    num_denoising=self.num_denoising, 
+                    label_noise_ratio=self.label_noise_ratio, 
+                    box_noise_scale=self.box_noise_scale, )
+        else:
+            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
+
+        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
+            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+
+        # decoder
+        out_bboxes, out_logits, out_landmarks, out_polar = self.decoder(
+            init_ref_contents,
+            init_ref_points_unact,
+            memory,
+            spatial_shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.dec_landmark_head,
+            self.dec_polar_head,
+            self.query_pos_head,
+            attn_mask=attn_mask)
+
+        # Generate landmark heatmaps from features
+        landmark_heatmaps = self.landmark_heatmap_head(
+            memory.permute(0, 2, 1).reshape(memory.shape[0], -1, *spatial_shapes[0]))
+
+        if self.training and dn_meta is not None:
+            dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
+            dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
+            dn_out_landmarks, out_landmarks = torch.split(out_landmarks, dn_meta['dn_num_split'], dim=2)
+            dn_out_polar, out_polar = torch.split(out_polar, dn_meta['dn_num_split'], dim=2)
+
+        # Parse polar predictions
+        polar_predictions = []
+        for polar_layer in out_polar:
+            polar_pred = {}
+            for head_name, head in self.dec_polar_head[0].items():
+                if head_name == 'angle_cls':
+                    polar_pred['polar_angle_logits'] = polar_layer[..., :self.polar_bins]
+                elif head_name == 'angle_reg':
+                    polar_pred['polar_angle_reg'] = polar_layer[..., self.polar_bins:self.polar_bins+1]
+                elif head_name == 'magnitude':
+                    polar_pred['polar_magnitude'] = polar_layer[..., self.polar_bins+1:self.polar_bins+2]
+            polar_predictions.append(polar_pred)
+
+        out = {
+            'pred_logits': out_logits[-1], 
+            'pred_boxes': out_bboxes[-1],
+            'pred_landmarks': out_landmarks[-1],
+            'pred_polar': polar_predictions[-1],
+            'landmark_heatmaps': landmark_heatmaps
+        }
+
+        if self.training and self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1], 
+                                                  out_landmarks[:-1], polar_predictions[:-1])
+            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list, [], [])
+            out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
+
+            if dn_meta is not None:
+                dn_polar_predictions = []
+                for polar_layer in dn_out_polar:
+                    polar_pred = {}
+                    for head_name in self.dec_polar_head[0].keys():
+                        if head_name == 'angle_cls':
+                            polar_pred['polar_angle_logits'] = polar_layer[..., :self.polar_bins]
+                        elif head_name == 'angle_reg':
+                            polar_pred['polar_angle_reg'] = polar_layer[..., self.polar_bins:self.polar_bins+1]
+                        elif head_name == 'magnitude':
+                            polar_pred['polar_magnitude'] = polar_layer[..., self.polar_bins+1:self.polar_bins+2]
+                    dn_polar_predictions.append(polar_pred)
+                    
+                out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes, 
+                                                         dn_out_landmarks, dn_polar_predictions)
+                out['dn_meta'] = dn_meta
+
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_landmarks=None, outputs_polar=None):
+        aux_outputs = []
+        for i, (a, b) in enumerate(zip(outputs_class, outputs_coord)):
+            aux_out = {'pred_logits': a, 'pred_boxes': b}
+            if outputs_landmarks and i < len(outputs_landmarks):
+                aux_out['pred_landmarks'] = outputs_landmarks[i]
+            if outputs_polar and i < len(outputs_polar):
+                aux_out['pred_polar'] = outputs_polar[i]
+            aux_outputs.append(aux_out)
+        return aux_outputs

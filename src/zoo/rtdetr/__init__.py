@@ -12,3 +12,8 @@ from .rtdetr_postprocessor import RTDETRPostProcessor
 # v2
 from .rtdetrv2_decoder import RTDETRTransformerv2
 from .rtdetrv2_criterion import RTDETRCriterionv2
+
+# Polar Face components
+from .polar_face_decoder import PolarFaceTransformer
+from .polar_face_criterion import PolarFaceCriterion
+from .polar_face_postprocessor import PolarFacePostProcessor

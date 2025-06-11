@@ -12,6 +12,7 @@ import torchvision.transforms.v2 as VT
 from torchvision.transforms.v2 import functional as VF, InterpolationMode
 
 import random
+import numpy as np
 from functools import partial
 
 from ..core import register
@@ -21,6 +22,7 @@ __all__ = [
     'DataLoader',
     'BaseCollateFunction', 
     'BatchImageCollateFuncion',
+    'FaceLandmarkCollateFuncion',
     'batch_image_collate_fn'
 ]
 
@@ -40,7 +42,8 @@ class DataLoader(data.DataLoader):
     def set_epoch(self, epoch):
         self._epoch = epoch 
         self.dataset.set_epoch(epoch)
-        self.collate_fn.set_epoch(epoch)
+        if hasattr(self.collate_fn, 'set_epoch'):
+            self.collate_fn.set_epoch(epoch)
     
     @property
     def epoch(self):
@@ -105,3 +108,129 @@ class BatchImageCollateFuncion(BaseCollateFunction):
 
         return images, targets
 
+
+@register()
+class FaceLandmarkCollateFuncion(BaseCollateFunction):
+    """Collate function for face detection with landmarks and polar domain features"""
+    
+    def __init__(
+        self,
+        scales=None,
+        stop_epoch=None,
+        polar_bins=36,  # Number of bins for polar rotation classification
+        heatmap_size=64,  # Size of landmark heatmaps
+        landmark_sigma=2.0,  # Sigma for Gaussian heatmaps
+    ) -> None:
+        super().__init__()
+        self.scales = scales
+        self.stop_epoch = stop_epoch if stop_epoch is not None else 100000000
+        self.polar_bins = polar_bins
+        self.heatmap_size = heatmap_size
+        self.landmark_sigma = landmark_sigma
+        
+    def __call__(self, items):
+        images = torch.cat([x[0][None] for x in items], dim=0)
+        targets = [x[1] for x in items]
+        
+        # Apply multi-scale training if enabled
+        if self.scales is not None and self.epoch < self.stop_epoch:
+            sz = random.choice(self.scales)
+            scale_factor = sz / images.shape[-1] if isinstance(sz, int) else sz[0] / images.shape[-1]
+            images = F.interpolate(images, size=sz)
+            
+            # Scale landmark coordinates accordingly
+            for target in targets:
+                if 'landmarks' in target:
+                    target['landmarks'] = target['landmarks'] * scale_factor
+                if 'boxes' in target:
+                    target['boxes'] = target['boxes'] * scale_factor
+                    
+        # Generate heatmaps for landmarks
+        for target in targets:
+            if 'landmarks' in target and target['landmarks'] is not None:
+                target['landmark_heatmaps'] = self._generate_landmark_heatmaps(
+                    target['landmarks'], images.shape[-2:])
+                    
+            # Generate polar domain features
+            if 'landmarks' in target and target['landmarks'] is not None:
+                target['polar_features'] = self._generate_polar_features(target['landmarks'])
+                
+        return images, targets
+    
+    def _generate_landmark_heatmaps(self, landmarks, image_size):
+        """Generate Gaussian heatmaps for landmarks"""
+        h, w = image_size
+        num_landmarks = len(landmarks) // 2
+        heatmaps = torch.zeros(num_landmarks, self.heatmap_size, self.heatmap_size)
+        
+        scale_x = self.heatmap_size / w
+        scale_y = self.heatmap_size / h
+        
+        for i in range(num_landmarks):
+            x = landmarks[i * 2] * scale_x
+            y = landmarks[i * 2 + 1] * scale_y
+            
+            # Create Gaussian heatmap
+            heatmap = self._create_gaussian_heatmap(
+                x, y, self.heatmap_size, self.heatmap_size, self.landmark_sigma)
+            heatmaps[i] = heatmap
+            
+        return heatmaps
+    
+    def _create_gaussian_heatmap(self, center_x, center_y, width, height, sigma):
+        """Create a Gaussian heatmap centered at (center_x, center_y)"""
+        x = torch.arange(0, width, dtype=torch.float32)
+        y = torch.arange(0, height, dtype=torch.float32)
+        
+        y = y.unsqueeze(1)
+        
+        x0 = center_x
+        y0 = center_y
+        
+        # Gaussian formula
+        heatmap = torch.exp(-((x - x0) ** 2 + (y - y0) ** 2) / (2 * sigma ** 2))
+        
+        return heatmap
+    
+    def _generate_polar_features(self, landmarks):
+        """Generate polar domain features from landmarks"""
+        if len(landmarks) < 10:  # Need at least 5 landmarks (10 coordinates)
+            return {
+                'polar_angle_bin': torch.tensor(0, dtype=torch.long),
+                'polar_angle_reg': torch.tensor(0.0, dtype=torch.float32),
+                'polar_magnitude': torch.tensor(0.0, dtype=torch.float32)
+            }
+        
+        # Get key landmarks (assuming 5-point landmarks: left_eye, right_eye, nose, left_mouth, right_mouth)
+        left_eye = torch.tensor([landmarks[0], landmarks[1]])
+        right_eye = torch.tensor([landmarks[2], landmarks[3]])
+        nose = torch.tensor([landmarks[4], landmarks[5]])
+        
+        # Calculate face center
+        face_center = (left_eye + right_eye + nose) / 3
+        
+        # Calculate face orientation vector (left eye to right eye)
+        eye_vector = right_eye - left_eye
+        
+        # Convert to polar coordinates
+        angle = torch.atan2(eye_vector[1], eye_vector[0])
+        magnitude = torch.norm(eye_vector)
+        
+        # Normalize angle to [0, 2π]
+        if angle < 0:
+            angle += 2 * np.pi
+            
+        # Convert to bin index
+        angle_bin = int((angle / (2 * np.pi)) * self.polar_bins) % self.polar_bins
+        
+        # Regression target (offset within bin)
+        bin_size = 2 * np.pi / self.polar_bins
+        bin_center = (angle_bin + 0.5) * bin_size
+        angle_offset = (angle - bin_center) / bin_size
+        
+        return {
+            'polar_angle_bin': torch.tensor(angle_bin, dtype=torch.long),
+            'polar_angle_reg': torch.tensor(angle_offset, dtype=torch.float32),
+            'polar_magnitude': torch.tensor(magnitude, dtype=torch.float32),
+            'face_center': face_center
+        }
