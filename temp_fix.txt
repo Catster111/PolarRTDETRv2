@@ -1,0 +1,12 @@
+        # Ensure landmarks is flattened and accessible as scalars
+        if landmarks.dim() > 1:
+            landmarks = landmarks.flatten()
+        
+        for i in range(num_landmarks):
+            x = float(landmarks[i * 2]) * scale_x
+            y = float(landmarks[i * 2 + 1]) * scale_y
+            
+            # Create Gaussian heatmap
+            heatmap = self._create_gaussian_heatmap(
+                x, y, self.heatmap_size, self.heatmap_size, self.landmark_sigma)
+            heatmaps[i] = heatmap

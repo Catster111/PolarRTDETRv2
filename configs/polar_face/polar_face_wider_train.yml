@@ -77,11 +77,11 @@ PolarFaceCriterion:
     loss_vfl: 1.0
     loss_bbox: 5.0
     loss_giou: 2.0
-    loss_landmarks: 10.0
+    loss_landmarks: 0.01
     loss_heatmaps: 5.0
-    loss_polar_cls: 2.0
+    loss_polar_cls: 1.0
     loss_polar_reg: 1.0
-    loss_polar_mag: 1.0
+    loss_polar_mag: 0.5
   losses: ['vfl', 'boxes', 'landmarks', 'heatmaps', 'polar_cls', 'polar_reg']
   alpha: 0.75
   gamma: 2.0
