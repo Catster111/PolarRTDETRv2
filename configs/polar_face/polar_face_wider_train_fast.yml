@@ -1,0 +1,236 @@
+# Polar Face Configuration for WIDER Face Training (Optimized for Speed)
+__include__: [
+  '../runtime.yml',
+]
+
+task: detection
+
+# Model Configuration
+model: RTDETR
+criterion: PolarFaceCriterion
+postprocessor: PolarFacePostProcessor
+
+# Override runtime settings for speed
+use_amp: True  # Enable mixed precision training
+scaler:
+  type: GradScaler
+  enabled: True
+
+use_focal_loss: True
+eval_spatial_size: [640, 640] # h w
+
+# Training Optimization Flags
+enable_landmarks: True
+enable_heatmaps: False  # Disable expensive heatmap generation initially
+enable_polar_features: True
+progressive_training: True  # Gradually enable features as training progresses
+
+# Model Architecture
+RTDETR: 
+  backbone: PResNet
+  encoder: HybridEncoder
+  decoder: PolarFaceTransformer
+
+# Backbone
+PResNet:
+  depth: 50
+  variant: d
+  freeze_at: 0
+  return_idx: [1, 2, 3]
+  num_stages: 4
+  freeze_norm: True
+  pretrained: True 
+
+# Encoder
+HybridEncoder:
+  in_channels: [512, 1024, 2048]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.
+  enc_act: 'gelu'
+  expansion: 1.0
+  depth_mult: 1
+  act: 'silu'
+
+# Polar Face Transformer
+PolarFaceTransformer:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  eval_idx: -1
+  num_points: [4, 4, 4]
+  cross_attn_method: default
+  query_select_method: default
+  
+  # Face-specific parameters
+  num_landmarks: 5
+  polar_bins: 36
+  heatmap_size: 64
+
+# Postprocessor
+PolarFacePostProcessor:
+  num_top_queries: 300
+  num_landmarks: 5
+  polar_bins: 36
+
+# Loss Configuration
+PolarFaceCriterion:
+  weight_dict: 
+    loss_vfl: 1.0
+    loss_bbox: 5.0
+    loss_giou: 2.0
+    loss_landmarks: 10.0
+    loss_heatmaps: 5.0
+    loss_polar_cls: 2.0
+    loss_polar_reg: 1.0
+    loss_polar_mag: 1.0
+  losses: ['vfl', 'boxes', 'landmarks']  # Start with core losses only
+  alpha: 0.75
+  gamma: 2.0
+  num_landmarks: 5
+  polar_bins: 36
+  heatmap_size: 64
+  landmark_sigma: 2.0
+
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+# Dataset Configuration
+num_classes: 1
+remap_mscoco_category: False
+
+# Training Configuration
+epoches: 120
+clip_max_norm: 0.1
+
+# Optimizer
+optimizer:
+  type: AdamW
+  params: 
+    - 
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00001
+    - 
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Learning Rate Scheduler - Cosine Annealing for better convergence
+lr_scheduler:
+  type: CosineAnnealingLR
+  T_max: 120
+  eta_min: 0.00001
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 1000
+
+# EMA
+use_ema: True 
+ema:
+  type: ModelEMA
+  decay: 0.9999
+  warmups: 2000
+
+# Data Configuration
+train_dataloader: 
+  type: DataLoader
+  dataset: 
+    type: WiderFaceDetection
+    root: ./dataset/wider_face/WIDER_train/images/
+    ann_file: ./dataset/wider_face/wider_face_split/wider_face_train_bbx_gt.txt
+    image_set: train
+    return_landmarks: True
+    min_face_size: 16
+    use_synthetic_landmarks: True
+    transforms:
+      type: Compose
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}   
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 100
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+  
+  collate_fn:
+    type: FaceLandmarkCollateFuncion
+    scales: [640]  # Simplified multi-scale training initially
+    stop_epoch: 100
+    polar_bins: 36
+    heatmap_size: 64
+    landmark_sigma: 2.0
+
+  shuffle: True
+  total_batch_size: 8  # Increased batch size
+  num_workers: 8  # Increased worker count
+  pin_memory: True  # Enable memory pinning for faster data transfer
+  persistent_workers: True  # Keep workers alive between epochs
+  prefetch_factor: 2  # Prefetch batches
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: WiderFaceDetection
+    root: ./dataset/wider_face/WIDER_val/images/
+    ann_file: ./dataset/wider_face/wider_face_split/wider_face_val_bbx_gt.txt
+    image_set: val
+    return_landmarks: True
+    min_face_size: 16
+    use_synthetic_landmarks: True
+    transforms:
+      type: Compose
+      ops: 
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}   
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  
+  collate_fn:
+    type: FaceLandmarkCollateFuncion
+    polar_bins: 36
+    heatmap_size: 64
+    landmark_sigma: 2.0
+    
+  shuffle: False
+  total_batch_size: 8
+  num_workers: 8
+  pin_memory: True
+  persistent_workers: True
+
+# Evaluation
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+
+# Training Phases - Progressive activation of features
+training_phases:
+  - {epoch: 0, losses: ['vfl', 'boxes', 'landmarks'], enable_heatmaps: False, enable_polar_features: False}
+  - {epoch: 40, losses: ['vfl', 'boxes', 'landmarks', 'polar_cls', 'polar_reg'], enable_heatmaps: False, enable_polar_features: True}
+  - {epoch: 80, losses: ['vfl', 'boxes', 'landmarks', 'polar_cls', 'polar_reg', 'heatmaps'], enable_heatmaps: True, enable_polar_features: True}
+
+# Output
+output_dir: ./output/polar_face_wider_train_fast
+print_freq: 50
