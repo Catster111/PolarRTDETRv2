@@ -1,6 +1,6 @@
 """Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 
-Test script for WIDER Face dataset and polar face functionality data
+Test script for WIDER Face dataset and polar face functionality dataห
 """
 
 import os
