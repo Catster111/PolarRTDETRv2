@@ -1,0 +1,180 @@
+# Polar-RTDETRv2 Configuration for WiderFace Dataset with 5 Landmarks
+# This configuration file defines all parameters for training and evaluating
+# the Polar-RTDETRv2 model on WiderFace dataset with 5 facial landmarks.
+
+# ===== DATASET CONFIGURATION =====
+dataset:
+  name: 'widerface'
+  # Root directory of the WiderFace dataset on your local filesystem
+  widerface_path: 'dataset/WIDERFACE'
+  # JSON annotation files produced by your labelling tool live under
+  #   ${widerface_path}/annotations/
+  # The loader will pick these instead of the legacy *.txt splits.
+  annotations:
+    train: 'annotations/train_wider_face.json'  # relative to widerface_path
+    val:   'annotations/val_wider_face.json'    # relative to widerface_path
+  # All JSON paths are relative to the images root directory below,
+  # e.g. "0--Parade/xxx.jpg" -> "WIDER_train/images/0--Parade/xxx.jpg".
+  # The loader will automatically prepend this prefix when loading an image.
+  image_prefix: 'WIDER_train/images/'           # <---- NEW
+  use_polar: true  # Use polar coordinate representation
+  filter_invalid: true  # Filter invalid face annotations
+  min_face_size: 8  # Minimum face size in pixels
+  cache_mode: false  # Whether to cache images in memory
+  num_workers: 8  # Number of data loading workers
+  batch_size: 16  # Batch size for training
+  
+  # Data augmentation
+  augmentation:
+    random_flip_prob: 0.5  # Probability of horizontal flip
+    random_crop_prob: 0.5  # Probability of random crop
+    brightness_contrast_prob: 0.5  # Probability of brightness/contrast adjustment
+    hsv_prob: 0.3  # Probability of HSV augmentation
+    blur_prob: 0.1  # Probability of applying blur
+    noise_prob: 0.1  # Probability of adding noise
+    preserve_landmarks: true  # Ensure landmarks are preserved during augmentation
+    
+  # Normalization
+  normalize:
+    mean: [0.485, 0.456, 0.406]  # RGB mean values
+    std: [0.229, 0.224, 0.225]  # RGB standard deviation values
+    
+  # Image resizing
+  image_size:
+    min_size: 800  # Minimum image size
+    max_size: 1333  # Maximum image size
+    test_size: 1100  # Test image size
+
+# ===== MODEL CONFIGURATION =====
+model:
+  name: 'polar_rtdetrv2'
+  
+  # Backbone configuration
+  backbone:
+    name: 'resnet50'  # ResNet50 backbone
+    dilation: false  # Whether to use dilated convolution
+    position_embedding: 'sine'  # Position embedding type
+    pretrained: true  # Use pretrained backbone
+    freeze_backbone_bn: false  # Whether to freeze backbone batch norm
+    
+  # Transformer configuration
+  transformer:
+    enc_layers: 6  # Number of encoder layers
+    dec_layers: 6  # Number of decoder layers
+    dim_feedforward: 2048  # Dimension of feedforward network
+    hidden_dim: 256  # Hidden dimension
+    dropout: 0.1  # Dropout rate
+    nheads: 8  # Number of attention heads
+    num_queries: 300  # Number of object queries
+    pre_norm: false  # Whether to use pre-normalization
+    
+  # Polar coordinate configuration
+  polar:
+    enabled: true  # Enable polar coordinate representation
+    center_mode: 'image_center'  # Center point for polar coordinates ('image_center' or 'face_center')
+    normalize_radius: true  # Normalize radius by image diagonal
+    angle_format: 'radians'  # Angle format ('radians' or 'degrees')
+    
+  # Face detection configuration
+  detection:
+    num_classes: 2  # Number of classes (background and face)
+    class_weights: [0.5, 1.0]  # Class weights for loss calculation
+    
+  # Landmark prediction configuration
+  landmarks:
+    enabled: true  # Enable landmark prediction
+    num_landmarks: 5  # Number of landmarks (5 for WiderFace)
+    landmark_loss_weight: 1.0  # Weight for landmark loss
+    visibility_prediction: true  # Predict landmark visibility
+    
+  # Initialization
+  init:
+    xavier_gain: 1.0  # Xavier initialization gain
+
+# ===== TRAINING CONFIGURATION =====
+training:
+  epochs: 50  # Number of training epochs
+  lr: 0.0001  # Base learning rate
+  lr_backbone: 0.00001  # Learning rate for backbone
+  lr_drop: 40  # Epoch at which to drop learning rate
+  lr_drop_factor: 0.1  # Factor by which to drop learning rate
+  weight_decay: 0.0001  # Weight decay
+  clip_max_norm: 0.1  # Gradient clipping max norm
+  
+  # Optimizer configuration
+  optimizer:
+    name: 'adamw'  # AdamW optimizer
+    beta1: 0.9  # Beta1 parameter
+    beta2: 0.999  # Beta2 parameter
+    
+  # Learning rate scheduler
+  lr_scheduler:
+    name: 'step'  # Step learning rate scheduler
+    warmup: true  # Whether to use warmup
+    warmup_epochs: 5  # Number of warmup epochs
+    warmup_factor: 0.1  # Warmup factor
+    
+  # Loss weights
+  loss_weights:
+    bbox: 5.0  # Bounding box loss weight
+    giou: 2.0  # GIoU loss weight
+    ce: 1.0  # Classification loss weight
+    landmarks: 10.0  # Landmarks loss weight
+    
+  # Matching
+  matcher:
+    cost_class: 1.0  # Class coefficient in the matching cost
+    cost_bbox: 5.0  # L1 box coefficient in the matching cost
+    cost_giou: 2.0  # giou box coefficient in the matching cost
+    cost_landmarks: 10.0  # Landmarks coefficient in the matching cost
+
+# ===== EVALUATION CONFIGURATION =====
+evaluation:
+  eval_freq: 1  # Evaluate every N epochs
+  save_freq: 1  # Save checkpoint every N epochs
+  
+  # Metrics
+  metrics:
+    map: true  # Mean Average Precision
+    map_iou_thresholds: [0.5, 0.75]  # IoU thresholds for mAP calculation
+    recall: true  # Recall metric
+    precision: true  # Precision metric
+    landmark_nme: true  # Normalized Mean Error for landmarks
+    inference_time: true  # Measure inference time
+    
+  # Visualization
+  visualization:
+    enabled: true  # Enable visualization
+    max_images: 100  # Maximum number of images to visualize
+    confidence_threshold: 0.5  # Confidence threshold for visualization
+    save_path: '/app/outputs/visualizations'  # Path to save visualizations
+
+# ===== INFERENCE CONFIGURATION =====
+inference:
+  confidence_threshold: 0.5  # Confidence threshold for detection
+  nms_threshold: 0.5  # NMS threshold
+  max_detections: 100  # Maximum number of detections per image
+  
+  # Export options
+  export:
+    formats: ['onnx', 'torchscript']  # Export formats
+    dynamic_axes: true  # Use dynamic axes for ONNX export
+    opset_version: 12  # ONNX opset version
+
+# ===== LOGGING CONFIGURATION =====
+logging:
+  log_freq: 10  # Log every N iterations
+  tensorboard: true  # Use TensorBoard for logging
+  wandb: false  # Use Weights & Biases for logging
+  
+  # Checkpointing
+  checkpointing:
+    save_dir: '/app/outputs/checkpoints'  # Directory to save checkpoints
+    save_top_k: 3  # Save top-k checkpoints
+    metric_monitor: 'val_map'  # Metric to monitor for best checkpoint
+    
+  # Debugging
+  debug:
+    enabled: false  # Enable debug mode
+    visualize_attention: false  # Visualize attention maps
+    profile: false  # Enable profiling

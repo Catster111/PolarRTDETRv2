@@ -1,0 +1,166 @@
+{
+  "dataset": {
+    "name": "widerface",
+    "widerface_path": "dataset/WIDERFACE",
+    "annotations": {
+      "train": "annotations/train_wider_face.json",
+      "val": "annotations/val_wider_face.json"
+    },
+    "image_prefix": "WIDER_train/images/",
+    "use_polar": true,
+    "filter_invalid": true,
+    "min_face_size": 8,
+    "cache_mode": false,
+    "num_workers": 4,
+    "batch_size": 4,
+    "augmentation": {
+      "random_flip_prob": 0.5,
+      "random_crop_prob": 0.5,
+      "brightness_contrast_prob": 0.5,
+      "hsv_prob": 0.3,
+      "blur_prob": 0.1,
+      "noise_prob": 0.1,
+      "preserve_landmarks": true
+    },
+    "normalize": {
+      "mean": [
+        0.485,
+        0.456,
+        0.406
+      ],
+      "std": [
+        0.229,
+        0.224,
+        0.225
+      ]
+    },
+    "image_size": {
+      "min_size": 800,
+      "max_size": 1333,
+      "test_size": 1100
+    }
+  },
+  "model": {
+    "name": "polar_rtdetrv2",
+    "backbone": {
+      "name": "resnet50",
+      "dilation": false,
+      "position_embedding": "sine",
+      "pretrained": true,
+      "freeze_backbone_bn": false
+    },
+    "transformer": {
+      "enc_layers": 6,
+      "dec_layers": 6,
+      "dim_feedforward": 2048,
+      "hidden_dim": 256,
+      "dropout": 0.1,
+      "nheads": 8,
+      "num_queries": 300,
+      "pre_norm": false
+    },
+    "polar": {
+      "enabled": true,
+      "center_mode": "image_center",
+      "normalize_radius": true,
+      "angle_format": "radians"
+    },
+    "detection": {
+      "num_classes": 2,
+      "class_weights": [
+        0.5,
+        1.0
+      ]
+    },
+    "landmarks": {
+      "enabled": true,
+      "num_landmarks": 5,
+      "landmark_loss_weight": 1.0,
+      "visibility_prediction": true
+    },
+    "init": {
+      "xavier_gain": 1.0
+    }
+  },
+  "training": {
+    "epochs": 1,
+    "lr": 0.0001,
+    "lr_backbone": 1e-05,
+    "lr_drop": 40,
+    "lr_drop_factor": 0.1,
+    "weight_decay": 0.0001,
+    "clip_max_norm": 0.1,
+    "optimizer": {
+      "name": "adamw",
+      "beta1": 0.9,
+      "beta2": 0.999
+    },
+    "lr_scheduler": {
+      "name": "step",
+      "warmup": true,
+      "warmup_epochs": 5,
+      "warmup_factor": 0.1
+    },
+    "loss_weights": {
+      "bbox": 5.0,
+      "giou": 2.0,
+      "ce": 1.0,
+      "landmarks": 10.0
+    },
+    "matcher": {
+      "cost_class": 1.0,
+      "cost_bbox": 5.0,
+      "cost_giou": 2.0,
+      "cost_landmarks": 10.0
+    }
+  },
+  "evaluation": {
+    "eval_freq": 1,
+    "save_freq": 1,
+    "metrics": {
+      "map": true,
+      "map_iou_thresholds": [
+        0.5,
+        0.75
+      ],
+      "recall": true,
+      "precision": true,
+      "landmark_nme": true,
+      "inference_time": true
+    },
+    "visualization": {
+      "enabled": true,
+      "max_images": 100,
+      "confidence_threshold": 0.5,
+      "save_path": "/app/outputs/visualizations"
+    }
+  },
+  "inference": {
+    "confidence_threshold": 0.5,
+    "nms_threshold": 0.5,
+    "max_detections": 100,
+    "export": {
+      "formats": [
+        "onnx",
+        "torchscript"
+      ],
+      "dynamic_axes": true,
+      "opset_version": 12
+    }
+  },
+  "logging": {
+    "log_freq": 10,
+    "tensorboard": true,
+    "wandb": false,
+    "checkpointing": {
+      "save_dir": "/app/outputs/checkpoints",
+      "save_top_k": 3,
+      "metric_monitor": "val_map"
+    },
+    "debug": {
+      "enabled": false,
+      "visualize_attention": false,
+      "profile": false
+    }
+  }
+}

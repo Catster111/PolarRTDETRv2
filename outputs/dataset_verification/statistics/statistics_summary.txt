@@ -1,0 +1,22 @@
+=== Dataset Statistics Summary ===
+
+--- Bounding Box Statistics ---
+Total bounding boxes: 80143
+Invalid coordinates: 0 (0.00%)
+Outside image: 55 (0.07%)
+Zero area: 0 (0.00%)
+Negative size: 0 (0.00%)
+
+--- Landmark Statistics ---
+Total faces with landmarks: 80143
+Missing landmarks: 0 (0.00%)
+Invalid coordinates: 0 (0.00%)
+Outside bbox: 2418 (3.02%)
+All zero (invisible): 13251 (16.53%)
+
+--- Landmark Visibility ---
+Right Eye: 66892 (83.47%)
+Left Eye: 66892 (83.47%)
+Nose: 66892 (83.47%)
+Right Mouth: 66892 (83.47%)
+Left Mouth: 66892 (83.47%)

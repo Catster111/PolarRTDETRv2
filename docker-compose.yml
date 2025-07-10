@@ -1,15 +1,53 @@
-version: "3.9"
+version: '3.8'
 
 services:
-  tensorrt-container:
+  polar-rtdetrv2:
     build:
       context: .
       dockerfile: Dockerfile
-    image: rtdetr-v2:23.01
-    volumes:
-      - ./:/workspace
-    runtime: nvidia
+    image: polar-rtdetrv2:latest
+    container_name: polar-rtdetrv2-training
+    runtime: nvidia  # Use NVIDIA runtime for GPU support
+    shm_size: 8gb    # Shared memory size for data loading
+    restart: unless-stopped
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-    stdin_open: true
-    tty: true
+      - NVIDIA_VISIBLE_DEVICES=all  # Use all available GPUs
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - OMP_NUM_THREADS=8
+      - WANDB_API_KEY=${WANDB_API_KEY:-}  # Optional Weights & Biases API key
+    volumes:
+      # Mount code repository
+      - ./:/app:rw
+      
+      # Mount dataset directory - adjust the host path as needed
+      - ${WIDERFACE_DATA_PATH:-./data/widerface}:/app/data/widerface:ro
+      
+      # Mount output directories
+      - ${OUTPUT_DIR:-./outputs}:/app/outputs:rw
+      - ${CHECKPOINT_DIR:-./outputs/checkpoints}:/app/outputs/checkpoints:rw
+      - ${LOG_DIR:-./outputs/logs}:/app/outputs/logs:rw
+      - ${VISUALIZATION_DIR:-./outputs/visualizations}:/app/outputs/visualizations:rw
+      
+      # Mount configuration files
+      - ${CONFIG_DIR:-./configs}:/app/configs:ro
+    ports:
+      - "6006:6006"  # TensorBoard
+      - "8888:8888"  # Jupyter (if needed)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Default command - can be overridden from command line
+    command: train --config configs/widerface.yaml --batch-size 16 --workers 8
+    
+    # Uncomment to use interactive shell instead of training
+    # command: shell
+
+networks:
+  default:
+    driver: bridge
