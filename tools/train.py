@@ -28,13 +28,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-# Prefer the newer torch.amp API (PyTorch ≥ 2.0).  Fall back to the older
-# torch.cuda.amp for compatibility with earlier versions.
-try:
-    from torch.amp import GradScaler, autocast
+# --------------------------------------------------------------------------- #
+# AMP compatibility: prefer the new `torch.amp` API (PyTorch ≥ 2.0);          #
+# fall back to legacy `torch.cuda.amp` when running on older versions.        #
+# --------------------------------------------------------------------------- #
+try:  # PyTorch ≥ 2.0
+    from torch.amp import GradScaler, autocast  # type: ignore
     _USE_NEW_AMP = True
-except ImportError:
-    from torch.cuda.amp import GradScaler, autocast
+except ImportError:  # Older PyTorch
+    from torch.cuda.amp import GradScaler, autocast  # type: ignore
     _USE_NEW_AMP = False
 
 import yaml
@@ -45,9 +47,12 @@ import logging
 # Add parent directory to path to allow imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# NOTE: use the project-local dataset utilities, **not** Hugging-Face `datasets`
-# to avoid the name-clash that caused the previous ImportError.
+# ------------------------------------------------------------------ #
+# Use the project-local dataset utilities;                           #
+# avoid the name-clash with Hugging-Face `datasets` package.         #
+# ------------------------------------------------------------------ #
 from polar_datasets import build_widerface, data_prefetcher
+
 from models import build_model
 from models.polar_rtdetrv2 import PolarRTDETRv2
 from engine.matcher import build_matcher
@@ -407,22 +412,25 @@ def train_one_epoch(
     # Training loop
     while samples is not None:
         i += 1
-
-        # Forward pass with mixed precision if enabled
+        
+        # Forward pass with (optional) mixed-precision
         if scaler is not None:
-            # Use the appropriate autocast context based on available API
+            # `torch.amp.autocast` (PyTorch ≥ 2.0) requires a `device_type`
+            # argument, while the legacy `torch.cuda.amp.autocast` does not.
             if _USE_NEW_AMP:
-                with autocast(device_type=device.type):
-                    outputs = model(samples)
-                    loss_dict = criterion(outputs, targets)
-                    weight_dict = criterion.weight_dict
-                    losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+                cast_ctx = autocast(device_type=device.type)
             else:
-                with autocast():
-                    outputs = model(samples)
-                    loss_dict = criterion(outputs, targets)
-                    weight_dict = criterion.weight_dict
-                    losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+                cast_ctx = autocast()
+
+            with cast_ctx:
+                outputs = model(samples)
+                loss_dict = criterion(outputs, targets)
+                weight_dict = criterion.weight_dict
+                losses = sum(
+                    loss_dict[k] * weight_dict[k]
+                    for k in loss_dict.keys()
+                    if k in weight_dict
+                )
         else:
             outputs = model(samples)
             loss_dict = criterion(outputs, targets)
@@ -452,8 +460,8 @@ def train_one_epoch(
             optimizer.step()
         
         # -----------------------------------------------------------------
-        # Warm-up LR update *after* the optimizer.step(), as required by
-        # PyTorch (avoids skipping the first LR value and silences warning).
+        # Warm-up LR update *after* optimizer.step(), as required by PyTorch
+        # to avoid skipping the first LR value.
         # -----------------------------------------------------------------
         if warmup_scheduler is not None and epoch == 0:
             warmup_scheduler.step()
@@ -1002,32 +1010,21 @@ def main(args):
     setup_wandb(config, args)
     
     # Setup device
-    # Select proper CUDA device.
-    # In non-distributed mode `local_rank` is usually -1; default to GPU 0.
+    # ------------------------------------------------------------------
+    # Select CUDA device.
+    #   • In non-distributed mode (`local_rank == -1`) default to GPU-0
+    #   • Otherwise honour the rank that the launcher (e.g. torchrun) sets
+    #   • Fallback to CPU if CUDA is unavailable
+    # ------------------------------------------------------------------
     if torch.cuda.is_available():
         cuda_index = 0 if args.local_rank < 0 else args.local_rank
         device = torch.device(f'cuda:{cuda_index}')
-        
-        # Log GPU information
-        logger.info("=" * 80)
-        logger.info("GPU INFORMATION:")
-        logger.info(f"  Using CUDA device: {torch.cuda.get_device_name(cuda_index)}")
-        logger.info(f"  Device capability: {torch.cuda.get_device_capability(cuda_index)}")
-        logger.info(f"  Total GPU memory: {torch.cuda.get_device_properties(cuda_index).total_memory / 1024**3:.2f} GB")
-        logger.info(f"  CUDA version: {torch.version.cuda}")
-        logger.info("=" * 80)
     else:
         device = torch.device('cpu')
-        logger.warning("=" * 80)
-        logger.warning("WARNING: CUDA is not available. Training will be slow on CPU!")
-        logger.warning("=" * 80)
-        
+
     logger.info(f"Using device: {device}")
     
-    # ------------------------------------------------------------------
     # Build datasets
-    # Validation set is optional – continue gracefully if it's missing.
-    # ------------------------------------------------------------------
     logger.info("Building datasets...")
     dataset_train, num_classes = build_widerface('train', config)
 
@@ -1113,15 +1110,7 @@ def main(args):
     warmup_scheduler, lr_scheduler = build_lr_scheduler(optimizer, config, len(data_loader_train))
     
     # Initialize AMP scaler
-    if args.amp:
-        if _USE_NEW_AMP:
-            # For newer PyTorch versions, use the new API
-            scaler = GradScaler()
-        else:
-            # For older PyTorch versions, use the legacy API
-            scaler = GradScaler()
-    else:
-        scaler = None
+    scaler = GradScaler() if args.amp else None
     
     # Create visualizer
     visualizer = None
@@ -1200,7 +1189,7 @@ def main(args):
             )
             
             # Save best checkpoint
-            if is_main_process() and eval_stats['mAP'] > best_map:
+            if has_val and is_main_process() and eval_stats['mAP'] > best_map:
                 best_map = eval_stats['mAP']
                 save_checkpoint(
                     model=model,
